@@ -22,9 +22,10 @@
 from playwright.sync_api import sync_playwright
 import re
 import os
+import html
 
 # ================== 配置 ==================
-BUG_TXT_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "zyb.txt")
+BUG_TXT_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "lzq2.txt")
 USER_DATA_DIR = r"C:\Users\liuxinyi\AppData\Local\Microsoft\Edge\User\Data"
 AUTO_SAVE = False          # 填写完每条后是否自动尝试保存
 AUTO_DROPDOWNS = True      # 是否自动填写下拉列表
@@ -41,13 +42,15 @@ WAIT_RETRY_MS = 250        # 首次展开失败后的重试等待
 # 选项数量少时优先用键盘导航的字段（比搜索+点击更快）。
 # 注意：只放 devui-select-input 类型的字段；devui-select-placeholder 类型（如"严重程度"）
 # 键盘导航焦点不对，会填不上。
-KEYBOARD_FIRST_LABELS = {"发现阶段"}
+KEYBOARD_FIRST_LABELS = set()  # 发现阶段有页面滚动问题，改用同 bug复现率 的直接点击
 
 # ---- 下拉框默认值（按需修改） ----
 # 注意："归属项目"默认已填好，已从本配置中移除
 DEFAULT_VALUES = {
     "归属功能": "APA",
-    "提出人": "张玉宝94270",
+    # "提出人": "张玉宝94270",
+    "提出人": "刘志强93433",
+    # "提出人": "袁如玉93481",
     "当前责任人": "闫小伟93436",
     "跟踪人": "杨学敏",
     "研发模块": "泊车-应用算法",
@@ -643,6 +646,14 @@ def select_by_keyboard(page, trigger, value, max_attempts=30):
         return False
 
     print(f"    🎹 键盘导航选择: {value}")
+
+    # 确保触发器获得键盘焦点（防止 contenteditable 编辑器等残留焦点抢占键盘事件）
+    try:
+        trigger.evaluate("el => { el.focus(); }")
+        page.wait_for_timeout(50)
+    except:
+        pass
+
     page.keyboard.press("Home")
     page.wait_for_timeout(80 if FAST_DROPDOWN_MODE else 200)
 
@@ -733,8 +744,8 @@ def safe_select_dropdown(page, label, value):
     # ---------- 2. 点击展开下拉列表 ----------
     print(f"    🔄 处理: {label} -> {value}")
     try:
-        # bug复现率在页面底部，Playwright 平滑滚动很慢，用 JS instant 滚动+点击加速
-        if label == "bug复现率":
+        # bug复现率/发现阶段在页面底部，Playwright 平滑滚动很慢且会触发 DevUI 面板自动关闭，用 JS instant 滚动+点击加速
+        if label in ("bug复现率", "发现阶段"):
             trigger.evaluate("el => { el.scrollIntoView({block:'center', behavior:'instant'}); el.click(); }")
             page.wait_for_timeout(80 if FAST_DROPDOWN_MODE else 200)
         else:
@@ -751,7 +762,7 @@ def safe_select_dropdown(page, label, value):
     if not is_panel_visible(page):
         print(f"    ⚠ 面板未展开，重试点击...")
         try:
-            if label == "bug复现率":
+            if label in ("bug复现率", "发现阶段"):
                 trigger.evaluate("el => el.click()")
                 page.wait_for_timeout(80 if FAST_DROPDOWN_MODE else 200)
             else:
@@ -775,8 +786,8 @@ def safe_select_dropdown(page, label, value):
             return True
         print(f"    ⚠ 键盘导航失败，回退到搜索+点击...")
 
-    # ---------- 3b. bug复现率选项少且无搜索框，直接尝试点击选项，跳过 find_search_input 耗时 ----------
-    if label == "bug复现率" and is_panel_visible(page):
+    # ---------- 3b. 选项少的字段直接点击选项，跳过 find_search_input 耗时 ----------
+    if label in ("bug复现率", "发现阶段") and is_panel_visible(page):
         if find_and_click_option(page, panels, value):
             close_all_dropdowns(page)
             page.wait_for_timeout(WAIT_CLICK_MS if FAST_DROPDOWN_MODE else 300)
@@ -879,6 +890,279 @@ def safe_select_dropdown(page, label, value):
     return False
 
 
+# ================== 描述 HTML 转换 ==================
+def text_to_html_with_links(text):
+    """
+    将纯文本转换为 HTML，其中的 http/https URL 自动转为 <a> 超链接。
+    换行符转为 <br>，HTML 特殊字符会被转义以防格式错乱。
+    """
+    text = text.replace('\r\n', '\n').replace('\r', '\n')
+    # 匹配 URL：到空白符、引号、括号、中文字符等为止
+    url_pattern = r'https?://[^\s<>"\'\)\]\u4e00-\u9fff\u3000-\u303f]+'
+
+    parts = []
+    last_end = 0
+    for m in re.finditer(url_pattern, text):
+        # URL 前的普通文本
+        if m.start() > last_end:
+            parts.append(('text', text[last_end:m.start()]))
+        # URL 本体（去掉末尾可能粘连的标点）
+        url = m.group(0).rstrip('.,;:!?。，；：！？）)」』】]')
+        trailing = m.group(0)[len(url):]
+        parts.append(('url', url))
+        if trailing:
+            parts.append(('text', trailing))
+        last_end = m.end()
+    # 末尾剩余普通文本
+    if last_end < len(text):
+        parts.append(('text', text[last_end:]))
+
+    html_parts = []
+    for ptype, pcontent in parts:
+        if ptype == 'url':
+            safe_url = pcontent.replace('"', '&quot;').replace("'", '&#39;')
+            display = html.escape(pcontent)
+            html_parts.append(f'<a href="{safe_url}" target="_blank">{display}</a>')
+        else:
+            escaped = html.escape(pcontent).replace('\n', '<br>\n')
+            html_parts.append(escaped)
+
+    return ''.join(html_parts)
+
+
+def _create_links_for_urls(page, editor, description):
+    """
+    在已填好纯文本的编辑器中，查找 URL 文本并用 execCommand('createLink') 创建超链接。
+    createLink 是浏览器原生建链命令，不会被 Angular/DevUI 的 XSS 清洗剥离 href。
+    """
+    url_pattern = r'https?://[^\s<>"\'\)\]\u4e00-\u9fff\u3000-\u303f]+'
+    urls = re.findall(url_pattern, description)
+    urls = [u.rstrip('.,;:!?。，；：！？）)」』】]') for u in urls]
+    # 去重
+    seen = set()
+    unique_urls = []
+    for u in urls:
+        if u not in seen:
+            seen.add(u)
+            unique_urls.append(u)
+
+    link_count = 0
+    for url in unique_urls:
+        try:
+            # 循环处理同一 URL 的多次出现
+            for _ in range(20):  # 最多处理 20 次出现
+                created = editor.evaluate("""(el, url) => {
+                    el.focus();
+                    // 用 TreeWalker 遍历所有文本节点，跳过已在 <a> 内的
+                    const walker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT, null);
+                    let node;
+                    while (node = walker.nextNode()) {
+                        if (node.parentElement && node.parentElement.tagName === 'A') continue;
+                        const text = node.textContent;
+                        const idx = text.indexOf(url);
+                        if (idx >= 0) {
+                            const range = document.createRange();
+                            range.setStart(node, idx);
+                            range.setEnd(node, idx + url.length);
+                            const sel = window.getSelection();
+                            sel.removeAllRanges();
+                            sel.addRange(range);
+                            document.execCommand('createLink', false, url);
+                            return true;
+                        }
+                    }
+                    return false;
+                }""", url)
+                if not created:
+                    break
+                link_count += 1
+        except:
+            pass
+    return link_count
+
+
+def fill_description_with_links(page, editor, description):
+    """
+    向富文本编辑器（contenteditable div）插入描述，URL 自动转为可点击超链接。
+    策略（逐级降级）：
+      0. 模拟剪贴板粘贴  —— 走编辑器原生 paste 处理器，链接处理最可靠
+      1. 插入纯文本 + createLink —— 用浏览器原生建链命令，不会被 XSS 清洗剥离 href
+      2. execCommand('insertHTML') + createLink 补救 —— 先插 HTML，href 被洗掉再用 createLink 补
+      3. 直接设 innerHTML + 派发事件 —— 兜底
+      4. fill() 纯文本 —— 最终兜底（链接不可点击，但至少内容能进去）
+    """
+    html_content = text_to_html_with_links(description)
+
+    # 描述里没有 URL 时，直接用 fill() 最快，不需要走剪贴板或建链流程
+    has_url = bool(re.search(r'https?://', description))
+    if not has_url:
+        try:
+            editor.fill(description)
+            editor.evaluate("el => el.dispatchEvent(new Event('input', {bubbles: true}))")
+            print("    ✅ 描述已填写（无URL，直接fill）")
+            return True
+        except:
+            pass
+
+    # 授予剪贴板权限（方法0需要）
+    try:
+        page.context.grant_permissions(['clipboard-read', 'clipboard-write'])
+    except:
+        pass
+
+    # ---- 方法0: 模拟剪贴板粘贴（最接近真实用户操作）----
+    try:
+        editor.click()
+        page.wait_for_timeout(50)
+
+        # 将 HTML 写入系统剪贴板
+        clipboard_ok = page.evaluate("""async (htmlContent) => {
+            try {
+                const htmlBlob = new Blob([htmlContent], {type: 'text/html'});
+                const textBlob = new Blob([htmlContent], {type: 'text/plain'});
+                const item = new ClipboardItem({
+                    'text/html': htmlBlob,
+                    'text/plain': textBlob
+                });
+                await navigator.clipboard.write([item]);
+                return true;
+            } catch(e) {
+                return false;
+            }
+        }""", html_content)
+
+        if clipboard_ok:
+            # 选中编辑器全部内容
+            editor.evaluate("""(el) => {
+                el.focus();
+                const range = document.createRange();
+                range.selectNodeContents(el);
+                const sel = window.getSelection();
+                sel.removeAllRanges();
+                sel.addRange(range);
+            }""")
+            page.wait_for_timeout(30)
+
+            # 模拟 Ctrl+V 粘贴
+            page.keyboard.press("Control+V")
+            page.wait_for_timeout(150)
+
+            # 验证链接
+            has_link = editor.evaluate(
+                "el => { const h = el.innerHTML; return h.includes('href=') && h.includes('<a '); }"
+            )
+            if has_link:
+                editor.evaluate("el => el.dispatchEvent(new Event('input', {bubbles: true}))")
+                print("    ✅ 描述已填写，数据链接已转为超链接（剪贴板粘贴）")
+                return True
+            else:
+                print("    ⚠ 剪贴板粘贴后未检测到超链接，尝试其他方法...")
+        else:
+            print("    ⚠ 剪贴板写入失败，尝试其他方法...")
+    except Exception as e:
+        print(f"    ⚠ 剪贴板粘贴失败: {e}")
+
+    # ---- 方法1: 插入纯文本 + createLink ----
+    try:
+        editor.click()
+        page.wait_for_timeout(50)
+
+        # 选中全部内容并删除
+        editor.evaluate("""(el) => {
+            el.focus();
+            const range = document.createRange();
+            range.selectNodeContents(el);
+            const sel = window.getSelection();
+            sel.removeAllRanges();
+            sel.addRange(range);
+            document.execCommand('delete', false, null);
+        }""")
+        page.wait_for_timeout(30)
+
+        # 逐行插入纯文本（保留换行）
+        lines = description.replace('\r\n', '\n').replace('\r', '\n').split('\n')
+        for i, line in enumerate(lines):
+            if i > 0:
+                # 插入换行（Shift+Enter = <br>）
+                page.keyboard.press("Shift+Enter")
+                page.wait_for_timeout(20)
+            if line:
+                editor.evaluate(
+                    "(el, text) => document.execCommand('insertText', false, text)",
+                    line
+                )
+                page.wait_for_timeout(20)
+
+        page.wait_for_timeout(50)
+
+        # 用 createLink 给 URL 创建超链接
+        link_count = _create_links_for_urls(page, editor, description)
+
+        editor.evaluate("el => el.dispatchEvent(new Event('input', {bubbles: true}))")
+
+        if link_count > 0:
+            print(f"    ✅ 描述已填写，{link_count} 个数据链接已转为超链接")
+            return True
+        else:
+            print("    ✅ 描述已填写（未检测到URL或建链失败）")
+            return True
+    except Exception as e:
+        print(f"    ⚠ insertText+createLink方式失败: {e}")
+
+    # ---- 方法2: execCommand('insertHTML') + createLink 补救 ----
+    try:
+        editor.click()
+        page.wait_for_timeout(50)
+        inserted = editor.evaluate("""(el, htmlContent) => {
+            el.focus();
+            const range = document.createRange();
+            range.selectNodeContents(el);
+            const sel = window.getSelection();
+            sel.removeAllRanges();
+            sel.addRange(range);
+            document.execCommand('insertHTML', false, htmlContent);
+            return el.innerHTML.length > 0;
+        }""", html_content)
+        if inserted:
+            # 检查 href 是否被编辑器清洗掉了
+            has_href = editor.evaluate("el => el.innerHTML.includes('href=')")
+            if not has_href:
+                # href 被剥离，用 createLink 补救
+                print("    🔗 insertHTML 的 href 被清洗，用 createLink 补救...")
+                _create_links_for_urls(page, editor, description)
+
+            editor.evaluate("el => el.dispatchEvent(new Event('input', {bubbles: true}))")
+            has_link = editor.evaluate("el => el.innerHTML.includes('href=')")
+            if has_link:
+                print("    ✅ 描述已填写，数据链接已转为超链接")
+            else:
+                print("    ✅ 描述已填写")
+            return True
+    except Exception as e:
+        print(f"    ⚠ execCommand方式失败: {e}")
+
+    # ---- 方法3: 直接设置 innerHTML + 派发事件 ----
+    try:
+        editor.evaluate("""(el, htmlContent) => {
+            el.focus();
+            el.innerHTML = htmlContent;
+            el.dispatchEvent(new Event('input', {bubbles: true}));
+            el.dispatchEvent(new Event('change', {bubbles: true}));
+        }""", html_content)
+        print("    ✅ 描述已填写（innerHTML方式）")
+        return True
+    except Exception as e:
+        print(f"    ⚠ innerHTML设置失败: {e}")
+
+    # ---- 方法4: 回退到纯文本 fill（链接不可点击）----
+    try:
+        editor.fill(description)
+        print("    ⚠ 描述已填写（纯文本回退，链接不可点击）")
+        return True
+    except:
+        return False
+
+
 # ================== 表单填写 ==================
 def fill_bug_form(page, title, description):
     """在新建Bug界面填写所有字段"""
@@ -916,10 +1200,9 @@ def fill_bug_form(page, title, description):
         elem = loc.nth(i)
         try:
             if elem.is_visible():
-                elem.click()
-                elem.fill(description)
-                desc_filled = True
-                break
+                desc_filled = fill_description_with_links(page, elem, description)
+                if desc_filled:
+                    break
         except:
             continue
     if not desc_filled:
@@ -927,10 +1210,9 @@ def fill_bug_form(page, title, description):
             try:
                 body = fr.locator('body[contenteditable="true"], div[contenteditable="true"]')
                 if body.count() > 0 and body.first.is_visible():
-                    body.first.click()
-                    body.first.fill(description)
-                    desc_filled = True
-                    break
+                    desc_filled = fill_description_with_links(page, body.first, description)
+                    if desc_filled:
+                        break
             except:
                 continue
     if not desc_filled:
@@ -949,6 +1231,23 @@ def fill_bug_form(page, title, description):
         ok = False
     else:
         print(f"    ✅ 描述已填写")
+
+    # ---- 清理描述编辑器焦点/选区，避免残留焦点影响后续下拉框键盘导航 ----
+    try:
+        page.evaluate("""() => {
+            // 清除编辑器内残留的文本选区
+            if (window.getSelection) {
+                window.getSelection().removeAllRanges();
+            }
+            // 让当前聚焦元素失焦（contenteditable 编辑器等）
+            const active = document.activeElement;
+            if (active && active.blur && active.tagName !== 'BODY') {
+                active.blur();
+            }
+        }""")
+        page.wait_for_timeout(100)
+    except:
+        pass
 
     # ---- 自动填写下拉列表 ----
     if AUTO_DROPDOWNS and DEFAULT_VALUES:
